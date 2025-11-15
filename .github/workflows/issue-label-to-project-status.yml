@@ -1,0 +1,173 @@
+name: Sync issue label to project status
+
+on:
+  issues:
+    types: [opened, labeled, unlabeled, edited]
+
+permissions:
+  issues: read
+  projects: write
+  contents: read
+
+jobs:
+  sync-issue-label-to-project-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync issue label to project status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const core = require('@actions/core');
+
+            const issue = context.payload.issue;
+            if (!issue) {
+              core.info('No issue in context; exiting.');
+              return;
+            }
+
+            const labels = issue.labels || [];
+            const labelNames = labels.map(l => (typeof l === 'string' ? l : l.name).trim().toLowerCase());
+
+            const statusNames = ['Backlog', 'Ready', 'In progress', 'In review', 'Done'];
+            let targetStatusName = null;
+
+            for (const status of statusNames) {
+              if (labelNames.includes(status.toLowerCase())) {
+                targetStatusName = status;
+                break;
+              }
+            }
+
+            if (!targetStatusName) {
+              core.info(`No matching status label found on issue #${issue.number}; skipping.`);
+              return;
+            }
+
+            const owner = context.repo.owner; // e.g. "k3aworks"
+            const projectNumber = 10; // learn-project
+
+            const projectData = await github.graphql(
+              `query($owner: String!, $projectNumber: Int!) {
+                 user(login: $owner) {
+                   projectV2(number: $projectNumber) {
+                     id
+                     fields(first: 20) {
+                       nodes {
+                         ... on ProjectV2SingleSelectField {
+                           id
+                           name
+                           options {
+                             id
+                             name
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }
+               }`,
+              { owner, projectNumber }
+            );
+
+            const project = projectData.user && projectData.user.projectV2;
+            if (!project) {
+              core.setFailed(`Project number ${projectNumber} not found for owner ${owner}`);
+              return;
+            }
+
+            const statusField = (project.fields.nodes || []).find(
+              (field) => field && field.name === 'Status'
+            );
+
+            if (!statusField) {
+              core.setFailed('Status field not found in project');
+              return;
+            }
+
+            const option = (statusField.options || []).find(
+              (opt) => opt && opt.name === targetStatusName
+            );
+
+            if (!option) {
+              core.setFailed(`Status option "${targetStatusName}" not found in project`);
+              return;
+            }
+
+            const projectId = project.id;
+            const contentId = issue.node_id;
+
+            let itemId;
+            try {
+              const addItemResult = await github.graphql(
+                `mutation($projectId: ID!, $contentId: ID!) {
+                   addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                     item {
+                       id
+                     }
+                   }
+                 }`,
+                { projectId, contentId }
+              );
+
+              itemId = addItemResult.addProjectV2ItemById.item.id;
+              core.info(`Added issue #${issue.number} to project as item ${itemId}`);
+            } catch (error) {
+              core.warning(`addProjectV2ItemById failed (maybe already in project): ${error}`);
+
+              const itemsData = await github.graphql(
+                `query($projectId: ID!) {
+                   node(id: $projectId) {
+                     ... on ProjectV2 {
+                       items(first: 100) {
+                         nodes {
+                           id
+                           content {
+                             ... on Issue {
+                               id
+                             }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }`,
+                { projectId }
+              );
+
+              const nodes = (itemsData.node && itemsData.node.items && itemsData.node.items.nodes) || [];
+              const existing = nodes.find((node) => node.content && node.content.id === contentId);
+
+              if (!existing) {
+                core.setFailed('Could not find existing project item for this issue after add failure');
+                return;
+              }
+
+              itemId = existing.id;
+              core.info(`Found existing project item ${itemId} for issue #${issue.number}`);
+            }
+
+            await github.graphql(
+              `mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                 updateProjectV2ItemFieldValue(
+                   input: {
+                     projectId: $projectId,
+                     itemId: $itemId,
+                     fieldId: $fieldId,
+                     value: { singleSelectOptionId: $optionId }
+                   }
+                 ) {
+                   projectV2Item {
+                     id
+                   }
+                 }
+               }`,
+              {
+                projectId,
+                itemId,
+                fieldId: statusField.id,
+                optionId: option.id,
+              }
+            );
+
+            core.info(`Set project status for issue #${issue.number} to "${targetStatusName}"`);
