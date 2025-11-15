@@ -6,7 +6,7 @@ on:
 
 permissions:
   issues: read
-  projects: write
+  repository-projects: write
   contents: read
 
 jobs:
